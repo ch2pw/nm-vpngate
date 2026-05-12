@@ -70,15 +70,6 @@ AUTO_CSV_SERVERLIST=()
 # Currently, cipher is the only supported item
 FIX_OPENVPN_CONFIG=("cipher")
 
-# Marker stored in `user.data` of every NetworkManager connection we create,
-# so we can later identify which active VPNs were created by this script and
-# only disconnect those (without touching VPNs the user set up themselves).
-# The key follows NetworkManager's `user.data` rule that keys must contain a
-# dot and look like a DNS name.
-NM_OWNER_KEY="com.hayao0819.nm-vpngate.created-by"
-NM_OWNER_VALUE="nm-vpngate"
-NM_OWNER_DATA="${NM_OWNER_KEY}=${NM_OWNER_VALUE}"
-
 # About AUTO_SETUP
 # AUTO_SETUPは以前のバージョンで利用されていました
 # 現在では廃止されていますが、古い設定ファイルでも動かせるように一部で参照しています
@@ -665,11 +656,6 @@ _setup_vpn_nm_openvpn() {
     #-- Import OVPN file --#
     _log "Import ${_ovpn_file}"
     _run nmcli connection import type openvpn file "${_ovpn_file}"
-
-    # Tag the imported connection so _stop_vpn can identify it later.
-    # `nmcli connection import` does not accept arbitrary properties, so we
-    # set user.data via a follow-up modify.
-    _run nmcli connection modify "${PROFILE_NAME}" +user.data "${NM_OWNER_DATA}"
 }
 
 _setup_vpn_nm_l2tp() {
@@ -682,7 +668,6 @@ _setup_vpn_nm_l2tp() {
         connection.id "${PROFILE_NAME}" con-name "${PROFILE_NAME}" type vpn vpn-type l2tp ifname -- \
         connection.autoconnect no ipv4.method auto \
         ${_dns_args[@]+"${_dns_args[@]}"} \
-        user.data "${NM_OWNER_DATA}" \
         vpn.data "gateway = ${IPList[${SelectedIndex}]}, ipsec-enabled = yes, ipsec-psk = ${IPSEC_PSK}, mru = 1400, mtu = 1400, password-flags = 0, refuse-chap = yes, refuse-mschap = yes, refuse-pap = yes, user = ${USERNAME}" \
         vpn.secrets "password=${PASSWORD}"
 }
@@ -691,6 +676,10 @@ _setup_vpn_nm() {
     if nmcli -c no con | sed "1d" | cut -d " " -f 1 | grep -qx "${PROFILE_NAME}"; then
         _warn "${PROFILE_NAME} has been added to the Network Manager"
         _warn "Skip to add it and continue to connent"
+        # Connection may be from a prior run; record its UUID so --stop can
+        # find it. _nm_uuidlist_add dedups, so calling on already-tracked
+        # entries is safe.
+        _nm_uuidlist_add "${PROFILE_NAME}" || true
         return 0
     fi
     case "${VPN_TYPE}" in
@@ -702,6 +691,32 @@ _setup_vpn_nm() {
         _setup_vpn_nm_l2tp
         ;;
     esac
+    _nm_uuidlist_add "${PROFILE_NAME}" || true
+}
+
+# Look up the UUID of the named connection and append it (deduplicated) to
+# the persistent owned-UUID list.
+# _nm_uuidlist_add <connection-id>
+_nm_uuidlist_add() {
+    local _uuid _file="${CONFIG_DIR}/managed_uuids"
+    _uuid="$(nmcli -g connection.uuid connection show "${1}" 2>/dev/null || true)"
+    [[ -z "${_uuid}" ]] && return 1
+    if [[ ! -f "${_file}" ]] || ! grep -qxF "${_uuid}" "${_file}"; then
+        echo "${_uuid}" >>"${_file}"
+        _log "Recorded ownership of ${1} (${_uuid})"
+    fi
+    return 0
+}
+
+# Remove a UUID from the owned-UUID list. Called when REMOVE_PROFILE deletes
+# a connection so the list stays in sync with NetworkManager.
+# _nm_uuidlist_remove <uuid>
+_nm_uuidlist_remove() {
+    local _file="${CONFIG_DIR}/managed_uuids" _tmp
+    [[ -f "${_file}" ]] || return 0
+    _tmp="$(mktemp)"
+    grep -vxF "${1}" "${_file}" >"${_tmp}" || true
+    mv "${_tmp}" "${_file}"
 }
 
 # OpenVPNの設定ファイルをディレクトリに保存します
@@ -845,31 +860,25 @@ _connect_vpn() {
 
 #-- Stop VPN --#
 
-# Returns true if the connection identified by UUID was created by us, by
-# checking its `user.data` for the NM_OWNER marker.
-# _nm_is_managed <uuid>
-_nm_is_managed() {
-    nmcli -g user.data connection show "${1}" 2>/dev/null |
-        grep -qE "(^|, *)${NM_OWNER_KEY//./\\.} *= *${NM_OWNER_VALUE}( *,|$)"
-}
-
-# Print the UUIDs of all currently active VPN connections that we own.
-_nm_list_managed_active_uuids() {
+# Print UUIDs of currently active VPN connections that this script owns.
+# A connection is "owned" iff its UUID is listed in ${CONFIG_DIR}/managed_uuids.
+_nm_uuidlist_active_managed() {
+    local _file="${CONFIG_DIR}/managed_uuids"
+    [[ -f "${_file}" ]] || return 0
     local _uuid _type
     while IFS=: read -r _uuid _type; do
         [[ -z "${_uuid}" ]] && continue
-        # Currently we only create classic VPN profiles (type=vpn). If we
-        # later support WireGuard, allow `wireguard` here too.
+        # We only ever create classic VPN profiles (type=vpn).
         [[ "${_type}" = "vpn" ]] || continue
-        _nm_is_managed "${_uuid}" && echo "${_uuid}"
+        grep -qxF "${_uuid}" "${_file}" && echo "${_uuid}"
     done < <(nmcli -g UUID,TYPE connection show --active 2>/dev/null)
 }
 
 _stop_vpn_nm() {
     local _uuid _name _state _stopped=false _hint=""
 
-    # Cache hint covers connections from script versions before we started
-    # tagging with user.data.
+    # Cache hint helps when the persistent UUID list was lost or when the
+    # connection was created by an older script version that did not record.
     [[ -f "${CACHE_DIR}/connected" ]] && _hint="$(cat "${CACHE_DIR}/connected")"
 
     # Primary path: enumerate active VPNs we own and disconnect them.
@@ -885,14 +894,16 @@ _stop_vpn_nm() {
         if [[ "${REMOVE_PROFILE}" = true ]]; then
             _info "Removing ${_name}"
             nmcli connection delete uuid "${_uuid}" || true
+            _nm_uuidlist_remove "${_uuid}"
         fi
-    done < <(_nm_list_managed_active_uuids)
+    done < <(_nm_uuidlist_active_managed)
 
-    # Fallback path: untagged legacy connection recorded in the cache file.
+    # Fallback: legacy connection recorded in the cache file but missing
+    # from managed_uuids (e.g. profile created by an older nm-vpngate).
     if [[ "${_stopped}" = false ]] && [[ -n "${_hint}" ]]; then
         _state="$(nmcli -g GENERAL.STATE connection show "${_hint}" 2>/dev/null || true)"
         if [[ "${_state}" = "activated" ]] || [[ "${_state}" = "activating" ]]; then
-            _warn "Disconnecting ${_hint} from cache hint (no owner marker found)"
+            _warn "Disconnecting ${_hint} via cache hint (UUID not tracked)"
             nmcli connection down id "${_hint}" || true
             _stopped=true
             [[ "${REMOVE_PROFILE}" = true ]] && nmcli connection delete id "${_hint}" || true
